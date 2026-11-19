@@ -87,13 +87,13 @@ static gchar*
 notify_icon(gint volume)
 {
     if (volume < 0) {
-        return "audio-volume-muted-symbolic";
+        return "audio-volume-muted";
     } else if (volume >= 66) {
-        return "audio-volume-high-symbolic";
+        return "audio-volume-high";
     } else if (volume >= 33) {
-        return "audio-volume-medium-symbolic";
+        return "audio-volume-medium";
     } else {
-        return "audio-volume-low-symbolic";
+        return "audio-volume-low";
     }
 }
 
