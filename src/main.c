@@ -4,22 +4,33 @@
 #include <libnotify/notify.h>
 #include <locale.h>
 #include <math.h>
+#include <pulse/glib-mainloop.h>
 #include <pulse/pulseaudio.h>
+#include <pulse/timeval.h>
 #include <signal.h>
 
 #define PROGRAM_NAME "pa-notify"
 #define DEFAULT_DEBUG FALSE
 #define URGENCY_DEFAULT NOTIFY_URGENCY_LOW
+#define RECONNECT_MAX_ATTEMPT 3u
 
 typedef struct _Context
 {
-    pa_mainloop* loop;
+    GMainLoop* gloop;
+    pa_glib_mainloop* pa_loop;
     pa_mainloop_api* api;
     pa_context* context;
+    pa_time_event* reconnect_event;
     NotifyNotification* notification;
     gint volume;
+    guint reconnect_attempts;
 
 } Context;
+
+static gboolean
+pa_connect(Context* c);
+static void
+schedule_reconnect(Context* context, const gchar* reason);
 
 static struct config
 {
@@ -55,31 +66,41 @@ static GOptionEntry option_entries[] = {
 void
 context_init(Context* context)
 {
-    context->loop = NULL;
+    context->gloop = NULL;
+    context->pa_loop = NULL;
     context->api = NULL;
     context->context = NULL;
+    context->reconnect_event = NULL;
     context->notification = notify_notification_new(NULL, NULL, NULL);
     context->volume = -2;
+    context->reconnect_attempts = 0;
 }
 
 void
 context_free(Context* context)
 {
-    if (context != NULL) {
+    if (context->context) {
         pa_context_unref(context->context);
+        context->context = NULL;
     }
 
-    if (context->loop) {
+    if (context->reconnect_event && context->api) {
+        context->api->time_free(context->reconnect_event);
+        context->reconnect_event = NULL;
+    }
+
+    if (context->notification) {
+        g_object_unref(context->notification);
+        context->notification = NULL;
+    }
+
+    if (context->pa_loop) {
         pa_signal_done();
-        pa_mainloop_free(context->loop);
+        pa_glib_mainloop_free(context->pa_loop);
     }
-}
 
-void
-context_exit(Context* context, int retval)
-{
-    if (context->api) {
-        context->api->quit(context->api, retval);
+    if (context->gloop) {
+        g_main_loop_unref(context->gloop);
     }
 }
 
@@ -98,12 +119,12 @@ notify_icon(gint volume)
 }
 
 static void
-notify_message(NotifyNotification* notification,
-               const gchar* summary,
-               NotifyUrgency urgency,
-               const gchar* icon,
-               gint timeout,
-               gint volume)
+notification_apply(NotifyNotification* notification,
+                   const gchar* summary,
+                   NotifyUrgency urgency,
+                   const gchar* icon,
+                   gint timeout,
+                   gint volume)
 {
     notify_notification_update(notification, summary, NULL, icon);
     notify_notification_set_timeout(notification, timeout);
@@ -114,12 +135,49 @@ notify_message(NotifyNotification* notification,
     } else {
         notify_notification_set_hint(notification, "value", NULL);
     }
+}
 
-    notify_notification_show(notification, NULL);
+static gboolean
+notify_message(Context* context,
+               const gchar* summary,
+               NotifyUrgency urgency,
+               const gchar* icon,
+               gint timeout,
+               gint volume)
+{
+    GError* error = NULL;
+
+    notification_apply(context->notification, summary, urgency, icon, timeout, volume);
+    if (notify_notification_show(context->notification, &error)) {
+        return TRUE;
+    }
+
+    // The notification daemon may have been restarted, which invalidates the
+    // id stored in the reused notification object. Recreate it (fresh id) and
+    // retry once.
+    g_warning("Failed to show notification: %s. Recreating notification and retrying.",
+              error->message);
+    g_error_free(error);
+
+    g_object_unref(context->notification);
+    context->notification = notify_notification_new(NULL, NULL, NULL);
+    notification_apply(context->notification, summary, urgency, icon, timeout, volume);
+
+    error = NULL;
+    if (notify_notification_show(context->notification, &error)) {
+        return TRUE;
+    }
+
+    g_warning("Failed to show notification: %s", error->message);
+    g_error_free(error);
+    return FALSE;
 }
 
 static void
-sink_info_callback(pa_context* c, const pa_sink_info* i, int eol, void* userdata)
+sink_info_callback(pa_context* c G_GNUC_UNUSED,
+                   const pa_sink_info* i,
+                   int eol G_GNUC_UNUSED,
+                   void* userdata)
 {
     static gchar summery[255];
     float f_volume;
@@ -139,13 +197,10 @@ sink_info_callback(pa_context* c, const pa_sink_info* i, int eol, void* userdata
         }
 
         if (context->volume != volume) {
-            notify_message(context->notification,
-                           summery,
-                           config.urgency,
-                           notify_icon(volume),
-                           config.timeout,
-                           volume);
-            context->volume = volume;
+            if (notify_message(
+                  context, summery, config.urgency, notify_icon(volume), config.timeout, volume)) {
+                context->volume = volume;
+            }
         }
     }
 }
@@ -172,6 +227,48 @@ subscribe_callback(pa_context* c, pa_subscription_event_type_t type, uint32_t id
 }
 
 static void
+reconnect_callback(pa_mainloop_api* api,
+                   pa_time_event* event,
+                   const struct timeval* tv G_GNUC_UNUSED,
+                   void* userdata)
+{
+    Context* context = (Context*)userdata;
+
+    api->time_free(event);
+    context->reconnect_event = NULL;
+
+    if (!pa_connect(context)) {
+        schedule_reconnect(context, "cannot create PulseAudio context");
+    }
+}
+
+static void
+schedule_reconnect(Context* context, const gchar* reason)
+{
+    struct timeval tv;
+    guint delay_sec;
+
+    if (context->context) {
+        pa_context_unref(context->context);
+        context->context = NULL;
+    }
+
+    if (context->reconnect_event) {
+        return;
+    }
+
+    delay_sec = 1u << MIN(context->reconnect_attempts, RECONNECT_MAX_ATTEMPT);
+    context->reconnect_attempts++;
+
+    pa_gettimeofday(&tv);
+    pa_timeval_add(&tv, (pa_usec_t)delay_sec * PA_USEC_PER_SEC);
+
+    g_warning("Connection lost: %s. Trying to reconnect in %u second(s)...", reason, delay_sec);
+    context->reconnect_event =
+      context->api->time_new(context->api, &tv, reconnect_callback, context);
+}
+
+static void
 context_state_callback(pa_context* c, void* userdata)
 {
     switch (pa_context_get_state(c)) {
@@ -182,43 +279,85 @@ context_state_callback(pa_context* c, void* userdata)
 
         case PA_CONTEXT_READY:
             g_info("PulseAudio connection established.\n");
+            ((Context*)userdata)->reconnect_attempts = 0;
             // Subscribe to sink events from the server. This is how we get
             // volume change notifications from the server.
             pa_context_set_subscribe_callback(c, subscribe_callback, userdata);
-            pa_context_subscribe(c, PA_SUBSCRIPTION_MASK_SINK, NULL, NULL);
+            pa_operation* subscribe_op =
+              pa_context_subscribe(c, PA_SUBSCRIPTION_MASK_SINK, NULL, NULL);
+            if (subscribe_op) {
+                pa_operation_unref(subscribe_op);
+            }
             break;
 
         case PA_CONTEXT_TERMINATED:
             g_warning("PulseAudio connection terminated.\n");
-            context_exit(userdata, 0);
+            schedule_reconnect(userdata, "connection terminated");
             break;
 
         case PA_CONTEXT_FAILED:
         default:
             g_warning("Connection failure: %s\n", pa_strerror(pa_context_errno(c)));
-            context_exit(userdata, 1);
+            schedule_reconnect(userdata, pa_strerror(pa_context_errno(c)));
             break;
     }
 }
 
 static void
-exit_signal_callback(pa_mainloop_api* api, pa_signal_event* e, int sig, void* userdata)
+exit_signal_callback(pa_mainloop_api* api G_GNUC_UNUSED,
+                     pa_signal_event* e G_GNUC_UNUSED,
+                     int sig G_GNUC_UNUSED,
+                     void* userdata)
 {
-    if (api) {
-        api->quit(api, 0);
+    Context* context = (Context*)userdata;
+
+    if (context->gloop) {
+        g_main_loop_quit(context->gloop);
     }
+}
+
+static gboolean
+pa_connect(Context* c)
+{
+    if (!(c->context = pa_context_new(c->api, PROGRAM_NAME))) {
+        g_warning("pa_context_new failed");
+        return FALSE;
+    }
+
+    if (pa_context_connect(c->context, NULL, PA_CONTEXT_NOAUTOSPAWN, NULL) < 0) {
+        g_warning("pa_context_connect failed: %s", pa_strerror(pa_context_errno(c->context)));
+        pa_context_unref(c->context);
+        c->context = NULL;
+        return FALSE;
+    }
+    g_debug("pa_context_connect");
+
+    pa_context_set_state_callback(c->context, context_state_callback, c);
+    g_debug("pa_context_set_state_callback");
+
+    return TRUE;
 }
 
 gboolean
 pa_init(Context* c)
 {
-    if (!(c->loop = pa_mainloop_new())) {
-        g_warning("pa_mainloop_new failed");
+    // Integrate PulseAudio into the GLib main loop: this keeps the default
+    // GMainContext iterating, so libnotify's D-Bus proxy tracks notification
+    // daemon restarts (NameOwnerChanged signals) instead of pointing at a
+    // dead daemon forever.
+    if (!(c->pa_loop = pa_glib_mainloop_new(NULL))) {
+        g_warning("pa_glib_mainloop_new failed");
         return FALSE;
     }
-    g_debug("pa_mainloop_new");
+    g_debug("pa_glib_mainloop_new");
 
-    c->api = pa_mainloop_get_api(c->loop);
+    c->api = pa_glib_mainloop_get_api(c->pa_loop);
+    if (!(c->gloop = g_main_loop_new(NULL, FALSE))) {
+        g_warning("g_main_loop_new failed");
+        return FALSE;
+    }
+    g_debug("g_main_loop_new");
+
     if (pa_signal_init(c->api) != 0) {
         g_warning("pa_signal_init failed");
         return FALSE;
@@ -236,20 +375,9 @@ pa_init(Context* c)
     signal(SIGPIPE, SIG_IGN);
     g_debug("pa_signal_new SIGINT SIGTERM");
 
-    if (!(c->context = pa_context_new(c->api, PROGRAM_NAME))) {
-        g_warning("pa_context_new failed");
-        return FALSE;
+    if (!pa_connect(c)) {
+        schedule_reconnect(c, "initial connection failed");
     }
-    g_debug("pa_context_new");
-
-    if (pa_context_connect(c->context, NULL, PA_CONTEXT_NOAUTOSPAWN, NULL) < 0) {
-        g_warning("pa_context_connect ");
-        return FALSE;
-    }
-    g_debug("pa_context_connect");
-
-    pa_context_set_state_callback(c->context, context_state_callback, c);
-    g_debug("pa_context_set_state_callback");
 
     return TRUE;
 }
@@ -267,6 +395,7 @@ options_init(int argc, char* argv[])
     if (g_option_context_parse(option_context, &argc, &argv, &error) == FALSE) {
         g_warning("Cannot parse command line arguments: %s", error->message);
         g_error_free(error);
+        g_option_context_free(option_context);
         return FALSE;
     }
 
@@ -284,11 +413,10 @@ options_init(int argc, char* argv[])
         config.timeout *= 1000;
     }
 
-    if (config.urgency > NOTIFY_URGENCY_CRITICAL || config.urgency < NOTIFY_URGENCY_LOW)
-    {
-        g_warning("Invalid value '%d' for 'urgency' option. Valid values are: 0 (low), 1 (normal), 2 (critical)",
-                config.urgency);
-        g_error_free(error);
+    if (config.urgency > NOTIFY_URGENCY_CRITICAL || config.urgency < NOTIFY_URGENCY_LOW) {
+        g_warning("Invalid value '%d' for 'urgency' option. Valid values are: 0 (low), 1 (normal), "
+                  "2 (critical)",
+                  config.urgency);
         return FALSE;
     }
 
@@ -299,7 +427,6 @@ int
 main(int argc, char* argv[])
 {
     Context context;
-    int retval = 1;
 
     setlocale(LC_ALL, "");
 
@@ -307,18 +434,27 @@ main(int argc, char* argv[])
     g_info("Options have been initialized");
 
     context_init(&context);
-    g_return_val_if_fail(notify_init(PROGRAM_NAME), 1);
+    if (!notify_init(PROGRAM_NAME)) {
+        g_warning("Cannot initialize libnotify");
+        context_free(&context);
+        return 1;
+    }
     g_info("Notify has been initialized");
 
-    g_return_val_if_fail(pa_init(&context), 1);
+    if (!pa_init(&context)) {
+        g_warning("Cannot initialize PulseAudio");
+        notify_uninit();
+        context_free(&context);
+        return 1;
+    }
     g_info("PulseAudio has been initialized");
 
     g_info("Run loop");
-    pa_mainloop_run(context.loop, &retval);
+    g_main_loop_run(context.gloop);
     g_info("Stop loop");
 
     notify_uninit();
     context_free(&context);
 
-    return retval;
+    return 0;
 }
